@@ -1,112 +1,182 @@
-(without K8S Stage)
 pipeline {
+
     agent any
+
     tools {
-        jdk 'jdk17'
+        jdk 'jdk21'
         nodejs 'node23'
     }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+    }
+
     environment {
         SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_IMAGE = 'srinethdockerhub/bms:latest'
     }
+
     stages {
+
         stage('Clean Workspace') {
             steps {
                 cleanWs()
             }
         }
-        stage('Checkout from Git') {
+
+        stage('Checkout Code') {
             steps {
-                git branch: 'main', url: 'https://github.com/KastroVKiran/Book-My-Show.git'
-                sh 'ls -la'  // Verify files after checkout
+                checkout scmGit(branches: [[name: '*/main']], extensions: [], userRemoteConfigs: [[credentialsId: 'srineth-cred', url: 'https://github.com/Srinethgithub/Book-My-Show.git']])
             }
         }
+
         stage('SonarQube Analysis') {
             steps {
                 withSonarQubeEnv('sonar-server') {
-                    sh ''' 
-                    $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=BMS \
-                    -Dsonar.projectKey=BMS 
+                    sh '''
+                    $SCANNER_HOME/bin/sonar-scanner \
+                    -Dsonar.projectName=BookMyShow \
+                    -Dsonar.projectKey=bookmyshow-devops
                     '''
                 }
             }
         }
+
         stage('Quality Gate') {
             steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token'
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
+
         stage('Install Dependencies') {
             steps {
-                sh '''
-                cd bookmyshow-app
-                ls -la  # Verify package.json exists
-                if [ -f package.json ]; then
-                    rm -rf node_modules package-lock.json  # Remove old dependencies
-                    npm install  # Install fresh dependencies
-                else
-                    echo "Error: package.json not found in bookmyshow-app!"
-                    exit 1
-                fi
-                '''
+                dir('bookmyshow-app') {
+                    sh '''
+                    rm -rf node_modules package-lock.json
+                    npm install
+                    '''
+                }
             }
         }
-        stage('OWASP FS Scan') {
+
+        stage('OWASP Dependency Check') {
             steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                dependencyCheck additionalArguments: '--scan ./',
+                odcInstallation: 'DP-Check'
+
+                dependencyCheckPublisher pattern:
+                '**/dependency-check-report.xml'
             }
         }
-        stage('Trivy FS Scan') {
+
+        stage('Trivy FileSystem Scan') {
             steps {
                 sh 'trivy fs . > trivyfs.txt'
             }
         }
-        stage('Docker Build & Push') {
+
+        stage('Docker Build') {
             steps {
                 script {
-                    withDockerRegistry(credentialsId: 'docker', toolName: 'docker') {
-                        sh ''' 
-                        echo "Building Docker image..."
-                        docker build --no-cache -t kastrov/bms:latest -f bookmyshow-app/Dockerfile bookmyshow-app
+                    withDockerRegistry(
+                        credentialsId: 'docker-cred',
+                        toolName: 'docker'
+                    ) {
 
-                        echo "Pushing Docker image to registry..."
-                        docker push kastrov/bms:latest
+                        sh '''
+                        docker build \
+                        --no-cache \
+                        -t $DOCKER_IMAGE \
+                        -f bookmyshow-app/Dockerfile \
+                        bookmyshow-app
                         '''
                     }
                 }
             }
         }
-        stage('Deploy to Container') {
+
+        stage('Trivy Image Scan') {
             steps {
-                sh ''' 
-                echo "Stopping and removing old container..."
+                sh 'trivy image $DOCKER_IMAGE > trivyimage.txt'
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                script {
+                    withDockerRegistry(
+                        credentialsId: 'docker-cred',
+                        toolName: 'docker'
+                    ) {
+
+                        sh 'docker push $DOCKER_IMAGE'
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Container') {
+            steps {
+                sh '''
                 docker stop bms || true
                 docker rm bms || true
 
-                echo "Running new container on port 3000..."
-                docker run -d --restart=always --name bms -p 3000:3000 kastrov/bms:latest
+                docker pull $DOCKER_IMAGE
 
-                echo "Checking running containers..."
-                docker ps -a
+                docker run -d \
+                --name bms \
+                --restart always \
+                -p 3000:3000 \
+                $DOCKER_IMAGE
 
-                echo "Fetching logs..."
-                sleep 5  # Give time for the app to start
-                docker logs bms
+                docker ps
                 '''
             }
         }
     }
+
     post {
+
+        success {
+            emailext(
+                subject: "SUCCESS: ${env.JOB_NAME}",
+                body: """
+                Build Successful
+
+                Job Name: ${env.JOB_NAME}
+                Build Number: ${env.BUILD_NUMBER}
+
+                URL:
+                ${env.BUILD_URL}
+                """,
+                to: 'srinethsri@gmail.com'
+            )
+        }
+
+        failure {
+            emailext(
+                subject: "FAILED: ${env.JOB_NAME}",
+                body: """
+                Build Failed
+
+                Job Name: ${env.JOB_NAME}
+                Build Number: ${env.BUILD_NUMBER}
+
+                Check Console:
+                ${env.BUILD_URL}
+                """,
+                to: 'srinethsri@gmail.com'
+            )
+        }
+
         always {
-            emailext attachLog: true,
-                subject: "'${currentBuild.result}'",
-                body: "Project: ${env.JOB_NAME}<br/>" +
-                      "Build Number: ${env.BUILD_NUMBER}<br/>" +
-                      "URL: ${env.BUILD_URL}<br/>",
-                to: 'kastrokiran@gmail.com',
-                attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+            archiveArtifacts artifacts:
+            'trivyfs.txt,trivyimage.txt',
+            fingerprint: true
         }
     }
 }
+```
